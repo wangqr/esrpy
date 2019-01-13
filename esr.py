@@ -74,6 +74,35 @@ class Filter:
         return ret
 
 
+class Rip:
+    def __init__(self, pixel_difference, ignore_change):
+        self.pixel_difference = pixel_difference
+        self.ignore_change = ignore_change
+
+    def __call__(self, img1, img2):
+        if img2 is not None:
+            inter = np.count_nonzero(np.logical_and(img1, img2))
+            union = np.count_nonzero(np.logical_or(img1, img2))
+            return (union - inter > self.pixel_difference and
+                    2 * inter / (inter + union) < self.ignore_change / 100)
+        else:
+            return np.count_nonzero(img1) > self.pixel_difference
+
+
+class EsrTask:
+    def __init__(self):
+        self.video_file = None
+        self.frame_start = None
+        self.frame_end = None
+        self.frame_skip = None
+        self.top = None
+        self.bottom = None
+        self.left = None
+        self.right = None
+        self.filter = None
+        self.rip = None
+
+
 class ColorButton(wx.Button):
     def __init__(self, parent, log, size, disable=False):
         wx.Button.__init__(self, parent, log, size=(size, size))
@@ -219,15 +248,15 @@ class FilterFrame(wx.Frame):
     STATUS_REGION = 1
     STATUS_FILTER = 2
 
-    def __init__(self, parent, log, video, frame_count):
+    def __init__(self, parent, log, video, frame_count, task):
         self.video = video
+        self.task = task
         video_height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
         video_width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
         wx.Frame.__init__(self, parent, log, "Filter")
         p = wx.Panel(self, -1)
         self.advance = FilterAdvanceFrame(p, -1, self.update_filter)
         self.postprocessing = PostprocessingFrame(p, -1, self.update_filter)
-        self.filter = None
         self.p = p
         box_left = wx.BoxSizer(wx.VERTICAL)
         self.zoom_box = wx.StaticBoxSizer(wx.VERTICAL, p, 'Zoom')
@@ -319,9 +348,6 @@ class FilterFrame(wx.Frame):
         box_left.Add(region_box, 0, wx.EXPAND)
         box_left.Add(filter_settings_box, 0, wx.EXPAND)
         box_left.Add(pixel_color_box, 0, wx.EXPAND)
-        start_button = wx.Button(p, -1, 'Start')
-        start_button.Bind(wx.EVT_BUTTON, self.on_start_button)
-        box_left.Add(start_button, 0, wx.EXPAND | wx.ALL, 5)
         box_right = wx.StaticBoxSizer(wx.VERTICAL, p, 'Preview')
         _, self.img = video.read()
         self.current_frame = 0
@@ -333,7 +359,7 @@ class FilterFrame(wx.Frame):
         self.preview_bitmap.Bind(wx.EVT_LEFT_DOWN, self.on_left_down)
         self.preview_bitmap.Bind(wx.EVT_RIGHT_DOWN, self.on_right_down)
         self.preview_bitmap.Bind(wx.EVT_MOTION, self.on_motion)
-        preview_box = wx.BoxSizer()
+        preview_box = wx.BoxSizer(wx.HORIZONTAL)
         preview_box.Add(self.preview_bitmap, 0, wx.ALIGN_CENTER | wx.ALL, 5)
         box_right.Add(preview_box, 1, wx.ALIGN_CENTER)
         if frame_count > 1:
@@ -349,6 +375,7 @@ class FilterFrame(wx.Frame):
         self.Fit()
         self.status = self.STATUS_NONE
         self.update_filter()
+        self.Bind(wx.EVT_CLOSE, self.on_close)
 
     def on_left_down(self, event):
         x, y = self.preview_bitmap.ScreenToClient(wx.GetMousePosition())
@@ -443,8 +470,8 @@ class FilterFrame(wx.Frame):
             pass1 = None
         final = self.advance.final.get_filter()
         final.ref = subtitle_color
-        self.filter = Filter(self.acolor_checkbox.GetValue(),
-                             outline, pass1, final)
+        self.task.filter = Filter(self.acolor_checkbox.GetValue(),
+                                  outline, pass1, final)
         if self.status == self.STATUS_FILTER:
             self.update_preview()
 
@@ -461,7 +488,8 @@ class FilterFrame(wx.Frame):
                                          + (215, 227, 241)) / 2)
         elif self.status == self.STATUS_FILTER:
             img = self.img.copy()
-            img[t:b + 1, l:r + 1, :] = self.filter(img[t:b + 1, l:r + 1, :])
+            img[t:b + 1, l:r + 1, :] = self.task.filter(
+                img[t:b + 1, l:r + 1, :])
         else:
             img = self.img
         r = self.zoom_spin.GetValue() / 100
@@ -472,31 +500,130 @@ class FilterFrame(wx.Frame):
             wx.ImageFromBuffer(img.shape[1], img.shape[0],
                                img).ConvertToBitmap())
 
-    def on_start_button(self):
-        t, b = self.top_spin.GetValue(), self.bottom_spin.GetValue()
-        l, r = self.left_spin.GetValue(), self.right_spin.GetValue()
-        self.Hide()
-        self.filter.debug = False
-        esr(t, b, l ,r, self.filter)
+    def on_close(self, event):
+        self.update_filter()
+        self.task.top = self.top_spin.GetValue()
+        self.task.bottom = self.bottom_spin.GetValue()
+        self.task.left = self.left_spin.GetValue()
+        self.task.right = self.right_spin.GetValue()
+        RipFrame(None, -1, self.task).Show()
+        self.advance.Destroy()
+        self.postprocessing.Destroy()
+        self.Destroy()
 
 
-def esr(t, b, l, r, filter):
-    ...
+class RipFrame(wx.Frame):
+    def __init__(self, parent, log, task: EsrTask):
+        self.task = task
+        wx.Frame.__init__(self, parent, log, "Rip Option")
+        p = wx.Panel(self, -1)
+        frame_skip_box = wx.BoxSizer(wx.HORIZONTAL)
+        frame_skip_box.Add(wx.StaticText(p, -1, 'Frame Skip'), 1,
+                           wx.ALIGN_CENTER)
+        self.frame_skip_spin = wx.SpinCtrl(p, -1, min=0, max=10, initial=0)
+        frame_skip_box.Add(self.frame_skip_spin, 1, wx.ALIGN_CENTER | wx.LEFT,
+                           5)
+        pixel_box = wx.BoxSizer(wx.HORIZONTAL)
+        pixel_box.Add(wx.StaticText(p, -1, 'Pixel Difference'), 1,
+                      wx.ALIGN_CENTER)
+        self.pixel_spin = wx.SpinCtrl(p, -1, min=1, max=10000, initial=80)
+        pixel_box.Add(self.pixel_spin, 1, wx.ALIGN_CENTER | wx.LEFT, 5)
+        change_box = wx.BoxSizer(wx.HORIZONTAL)
+        change_box.Add(wx.StaticText(p, -1, 'Ignore Change (%)'), 1,
+                       wx.ALIGN_CENTER)
+        self.change_spin = wx.SpinCtrl(p, -1, min=1, max=100, initial=80)
+        change_box.Add(self.change_spin, 1, wx.ALIGN_CENTER | wx.LEFT, 5)
+        box = wx.BoxSizer(wx.VERTICAL)
+        box.Add(frame_skip_box, 0, wx.EXPAND | wx.ALL, 5)
+        box.Add(pixel_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        box.Add(change_box, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
+        p.SetSizer(box)
+        box.Fit(p)
+        self.Fit()
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+
+    def on_close(self, event):
+        self.task.frame_skip = self.frame_skip_spin.GetValue()
+        self.task.rip = Rip(self.pixel_spin.GetValue(),
+                            self.change_spin.GetValue())
+        self.Destroy()
+
+
+def frame_to_srt_timestamp(frame, fps):
+    if frame == 0:
+        return '00:00:00,000'
+    time = int(round((frame * 1000 - 500) / fps))
+    return ('%02d:%02d:%02d,%03d' % (
+        time // (3600 * 1000), time // (60 * 1000) % 60,
+        time // 1000 % 60, time % 1000))
+
+
+def esr_worker(task: EsrTask):
+    print(task.__dict__)
+    v = cv2.VideoCapture(task.video_file)
+    v.set(cv2.CAP_PROP_POS_FRAMES, task.frame_start)
+    result = []
+    prev_img = None
+    start_frame = 0
+    for frame in range(task.frame_start, task.frame_end, task.frame_skip + 1):
+        _, img = v.read()
+        if img is None:
+            print('WARNING: video ended unexpectedly')
+            break
+        if prev_img is not None:
+            if task.rip(img, prev_img):
+                result.append((start_frame, frame))
+                prev_img = None
+            else:
+                prev_img = img
+        if prev_img is None and task.rip(img, prev_img):
+            start_frame = frame
+            prev_img = img
+        for _ in range(task.frame_skip):
+            v.read()
+    if prev_img is not None:
+        result.append((start_frame, task.frame_end))
+    return result
+
+
+def esr_mp_spawn(task: EsrTask):
+    import multiprocessing as mp
+    p = mp.Pool()
+    p.map(...)
+    p.close()
+    p.join()
 
 
 if __name__ == '__main__':
     app = wx.App()
+    task = EsrTask()
+    task.frame_start = 0
     fd = wx.FileDialog(None)
     if fd.ShowModal() != wx.ID_OK:
         exit(1)
-    filename = fd.GetPath()
-    print(f'Loading Video "{filename}" ...')
-    v = cv2.VideoCapture(filename)
+    task.video_file = fd.GetPath()
+    print(f'Loading Video "{task.video_file}" ...')
+    v = cv2.VideoCapture(task.video_file)
     q = sp.run(
-        ['ffmpeg', '-i', filename, '-map', '0:v:0', '-c', 'copy', '-f',
+        ['ffmpeg', '-i', task.video_file, '-map', '0:v:0', '-c', 'copy', '-f',
          'null',
          '-'], stdin=sp.DEVNULL, stdout=sp.DEVNULL, stderr=sp.PIPE)
-    fc = int(q.stderr[q.stderr.rfind(b'frame=') + 6:].split(None, 1)[0])
-    f = FilterFrame(None, -1, v, fc)
-    f.Show()
-    exit(app.MainLoop())
+    task.frame_end = int(
+        q.stderr[q.stderr.rfind(b'frame=') + 6:].split(None, 1)[0])
+    fps = v.get(cv2.CAP_PROP_FPS)
+    FilterFrame(None, -1, v, task.frame_end, task).Show()
+    app.MainLoop()
+
+    fd = wx.FileDialog(None, wildcard="SubRip (*.srt)|*.srt",
+                       style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT)
+    if fd.ShowModal() != wx.ID_OK:
+        exit(2)
+    output_srt = fd.GetPath()
+    result = esr_worker(task)
+    with open(output_srt, 'w') as fp:
+        for idx, (start, end) in enumerate(result):
+            print(idx + 1, file=fp)
+            print(frame_to_srt_timestamp(start, fps), '-->',
+                  frame_to_srt_timestamp(end, fps), file=fp)
+            print(file=fp)
+            print(file=fp)
