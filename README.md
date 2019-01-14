@@ -2,9 +2,14 @@ This project is a esrXP re-implementation in python3, using wxWidget and OpenCV.
 
 # Usage
 
-Download and run `esr.py`.
+Install `ffmpeg` with your package manager, or put the binary to $PATH. On Windows, this can be done by putting the prebuilt exe in the same folder.
 
-Dependencies are `wxpython`, `python-opencv` and `ffmpeg`. The first 2 can be installed using pip. `ffmpeg` can be installed with package manager on linux, or download prebuilt exe and put in the same folder on Windows.
+Install dependencies by
+```sh
+pip install wxpython python-opencv tqdm
+```
+
+Then download and run `esr.py`.
 
 # Current status
 

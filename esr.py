@@ -5,7 +5,9 @@
 import cv2
 import wx
 import subprocess as sp
+import tqdm
 import numpy as np
+import multiprocessing as mp
 
 
 class FilterPass:
@@ -559,7 +561,7 @@ def frame_to_srt_timestamp(frame, fps):
         time // 1000 % 60, time % 1000))
 
 
-def esr_worker(task: EsrTask, iproc=0, nproc=1):
+def esr_worker(task: EsrTask, iproc=0, nproc=1, progress=None):
     frame_start = int(task.frame_start + (task.frame_skip + 1) * np.ceil(
         iproc * (task.frame_end - task.frame_start) / nproc / (
                 task.frame_skip + 1)))
@@ -567,17 +569,24 @@ def esr_worker(task: EsrTask, iproc=0, nproc=1):
         (iproc + 1) * (task.frame_end - task.frame_start) / nproc / (
                 task.frame_skip + 1)))
     v = cv2.VideoCapture(task.video_file)
-    v.set(cv2.CAP_PROP_POS_FRAMES, task.frame_start)
+    if frame_start:
+        v.set(cv2.CAP_PROP_POS_FRAMES, frame_start)
     result = []
     prev_img = None
     start_frame = 0
-    for frame in range(frame_start, frame_end, task.frame_skip + 1):
+    if progress is None:
+        iter = tqdm.tqdm(range(frame_start, frame_end, task.frame_skip + 1),
+                         unit='f')
+    else:
+        iter = range(frame_start, frame_end, task.frame_skip + 1)
+    for frame in iter:
         _, img = v.read()
         if img is None:
             print('WARNING: video ended unexpectedly')
             break
+        cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
         img = task.filter(
-            img[task.top:task.bottom + 1, task.left:task.right + 1, :])
+            img[task.top:task.bottom + 1, task.left:task.right + 1, :])[:, :, 0]
         if prev_img is not None:
             if task.rip(img, prev_img):
                 result.append((start_frame, frame))
@@ -589,25 +598,40 @@ def esr_worker(task: EsrTask, iproc=0, nproc=1):
             prev_img = img
         for _ in range(task.frame_skip):
             v.read()
+        if progress is not None:
+            progress.release()
     if prev_img is not None:
-        result.append((start_frame, task.frame_end))
+        result.append((start_frame, frame_end))
     return result
 
 
 class MpWorker:
-    def __init__(self, task, nproc):
+    def __init__(self, task, nproc, progress):
         self.task = task
         self.nproc = nproc
+        self.progress = progress
 
     def __call__(self, iproc):
-        return esr_worker(self.task, iproc, self.nproc)
+        return esr_worker(self.task, iproc, self.nproc, self.progress)
 
 
 def esr_mp_spawn(task: EsrTask):
-    import multiprocessing as mp
+    manager = mp.Manager()
+    progress = manager.Semaphore(value=0)
     nproc = mp.cpu_count()
+    if nproc == 1:
+        return esr_worker(task)
+    print(f'Spawning {nproc} processes ...')
     with mp.Pool(nproc) as p:
-        mp_result = p.map(MpWorker(task, nproc), range(nproc))
+        mp_result = p.map_async(MpWorker(task, nproc, progress), range(nproc))
+        with tqdm.tqdm(total=len(range(task.frame_start, task.frame_end,
+                                       task.frame_skip + 1)), unit='f') as pbar:
+            for _ in range(pbar.total):
+                while not progress.acquire():
+                    pass
+                pbar.update()
+    mp_result = mp_result.get()
+    print(f'Collecting results ...')
     v = cv2.VideoCapture(task.video_file)
     result = []
     for x in mp_result:
@@ -622,9 +646,11 @@ def esr_mp_spawn(task: EsrTask):
             # contains less than rip.pixel_difference pixels.
             v.set(cv2.CAP_PROP_POS_FRAMES, result[-1][1] - 1)
             _, img = v.read()
+            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
             img_prev = task.filter(
                 img[task.top:task.bottom + 1, task.left:task.right + 1, :])
             _, img = v.read()
+            cv2.cvtColor(img, cv2.COLOR_BGR2RGB, img)
             img = task.filter(
                 img[task.top:task.bottom + 1, task.left:task.right + 1, :])
             if task.rip(img, img_prev):
@@ -637,7 +663,7 @@ def esr_mp_spawn(task: EsrTask):
     return result
 
 
-if __name__ == '__main__':
+def main():
     app = wx.App()
     task = EsrTask()
     task.frame_start = 0
@@ -671,3 +697,7 @@ if __name__ == '__main__':
                   frame_to_srt_timestamp(end, fps), file=fp)
             print(file=fp)
             print(file=fp)
+
+
+if __name__ == '__main__':
+    main()
