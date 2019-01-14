@@ -15,9 +15,7 @@ PR and issue welcome!
   - [x] Basic filters
   - [ ] Pixel Compensate (Not sure what this is, help wanted)
   - [ ] Postprocessing
-- Rip
-  - [x] Basic function
-  - [ ] Parallelization
+- [x] Rip
 - [ ] Manager
 - [ ] Main window
 ----

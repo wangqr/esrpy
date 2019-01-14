@@ -62,7 +62,7 @@ class Filter:
             for i, j in zip(*pass1.nonzero()):
                 if ret[i, j, 2]:
                     cv2.floodFill(ret, None, (j, i), (0, 128, 0))
-            ret[pass1] = 0
+            ret[np.logical_and(np.logical_not(outline), pass1)] = 0
 
         sub = (ret == 255).all(2)
         final = self.final(img)
@@ -506,6 +506,7 @@ class FilterFrame(wx.Frame):
         self.task.bottom = self.bottom_spin.GetValue()
         self.task.left = self.left_spin.GetValue()
         self.task.right = self.right_spin.GetValue()
+        self.task.filter.debug = False
         RipFrame(None, -1, self.task).Show()
         self.advance.Destroy()
         self.postprocessing.Destroy()
@@ -558,18 +559,25 @@ def frame_to_srt_timestamp(frame, fps):
         time // 1000 % 60, time % 1000))
 
 
-def esr_worker(task: EsrTask):
-    print(task.__dict__)
+def esr_worker(task: EsrTask, iproc=0, nproc=1):
+    frame_start = int(task.frame_start + (task.frame_skip + 1) * np.ceil(
+        iproc * (task.frame_end - task.frame_start) / nproc / (
+                task.frame_skip + 1)))
+    frame_end = int(task.frame_start + (task.frame_skip + 1) * np.ceil(
+        (iproc + 1) * (task.frame_end - task.frame_start) / nproc / (
+                task.frame_skip + 1)))
     v = cv2.VideoCapture(task.video_file)
     v.set(cv2.CAP_PROP_POS_FRAMES, task.frame_start)
     result = []
     prev_img = None
     start_frame = 0
-    for frame in range(task.frame_start, task.frame_end, task.frame_skip + 1):
+    for frame in range(frame_start, frame_end, task.frame_skip + 1):
         _, img = v.read()
         if img is None:
             print('WARNING: video ended unexpectedly')
             break
+        img = task.filter(
+            img[task.top:task.bottom + 1, task.left:task.right + 1, :])
         if prev_img is not None:
             if task.rip(img, prev_img):
                 result.append((start_frame, frame))
@@ -586,12 +594,47 @@ def esr_worker(task: EsrTask):
     return result
 
 
+class MpWorker:
+    def __init__(self, task, nproc):
+        self.task = task
+        self.nproc = nproc
+
+    def __call__(self, iproc):
+        return esr_worker(self.task, iproc, self.nproc)
+
+
 def esr_mp_spawn(task: EsrTask):
     import multiprocessing as mp
-    p = mp.Pool()
-    p.map(...)
-    p.close()
-    p.join()
+    nproc = mp.cpu_count()
+    with mp.Pool(nproc) as p:
+        mp_result = p.map(MpWorker(task, nproc), range(nproc))
+    v = cv2.VideoCapture(task.video_file)
+    result = []
+    for x in mp_result:
+        if not x:
+            pass
+        elif not result:
+            result = x
+        elif result[-1][1] == x[0][0]:
+            # We check if the last frame of previous segment and first frame of
+            # next segment belongs to same line. The result will be the same as
+            # non-parallelized in most cases, but will be different if next line
+            # contains less than rip.pixel_difference pixels.
+            v.set(cv2.CAP_PROP_POS_FRAMES, result[-1][1] - 1)
+            _, img = v.read()
+            img_prev = task.filter(
+                img[task.top:task.bottom + 1, task.left:task.right + 1, :])
+            _, img = v.read()
+            img = task.filter(
+                img[task.top:task.bottom + 1, task.left:task.right + 1, :])
+            if task.rip(img, img_prev):
+                result.extend(x)
+            else:
+                result[-1] = (result[-1][0], x[0][1])
+                result.extend(x[1:])
+        else:
+            result.extend(x)
+    return result
 
 
 if __name__ == '__main__':
@@ -619,7 +662,8 @@ if __name__ == '__main__':
     if fd.ShowModal() != wx.ID_OK:
         exit(2)
     output_srt = fd.GetPath()
-    result = esr_worker(task)
+    result = esr_mp_spawn(task)
+    # result = esr_worker(task)
     with open(output_srt, 'w') as fp:
         for idx, (start, end) in enumerate(result):
             print(idx + 1, file=fp)
